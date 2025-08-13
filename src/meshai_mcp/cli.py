@@ -35,7 +35,7 @@ def main(ctx: click.Context, version: bool):
 
 
 @main.command()
-@click.option('--host', default='localhost', help='Host to bind to (HTTP mode)')
+@click.option('--host', default='0.0.0.0', help='Host to bind to (HTTP mode)')
 @click.option('--port', default=8080, help='Port to bind to (HTTP mode)')
 @click.option('--transport', default='stdio', type=click.Choice(['stdio', 'http']), 
               help='Transport protocol')
@@ -61,21 +61,30 @@ def serve(host: str, port: int, transport: str, dev: bool, log_level: Optional[s
         console.print("📡 Listening on stdin/stdout")
     else:
         console.print(f"📡 Listening on {host}:{port}")
+        console.print(f"🌐 API Documentation: http://{host}:{port}/docs")
     
     # Check environment
     api_url = os.getenv('MESHAI_API_URL', 'http://localhost:8080')
     api_key = os.getenv('MESHAI_API_KEY')
     
-    if not api_key:
+    if not api_key and transport == 'stdio':
         console.print("⚠️  [bold yellow]Warning:[/bold yellow] MESHAI_API_KEY not set")
     
     console.print(f"🔗 MeshAI API: {api_url}")
     
-    # Start server
-    server = MeshAIMCPServer()
+    if transport == 'http':
+        console.print("🔐 Authentication: API Key required")
+        console.print("📖 Usage: curl -H 'Authorization: Bearer YOUR_API_KEY' http://localhost:8080/v1/tools")
     
+    # Start server
     try:
-        asyncio.run(server.serve(transport=transport))
+        if transport == 'stdio':
+            from .server import MeshAIMCPServer
+            server = MeshAIMCPServer()
+            asyncio.run(server.serve(transport='stdio'))
+        else:
+            from .http_server import serve_http
+            asyncio.run(serve_http(host=host, port=port))
     except KeyboardInterrupt:
         console.print("\n👋 Shutting down MeshAI MCP Server")
     except Exception as e:

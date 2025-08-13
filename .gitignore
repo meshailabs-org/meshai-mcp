@@ -152,3 +152,22 @@ cython_debug/
 mcp_config.json
 .mcp.json
 claude_config.json
+
+# Deployment configurations (keep private)
+gcp/
+aws/
+azure/
+k8s/
+terraform/
+deployment/
+deploy.sh
+cloudbuild.yaml
+service.yaml
+
+# Environment and secrets
+.env.production
+.env.staging
+secrets/
+*.key
+*.pem
+*.crt

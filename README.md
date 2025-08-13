@@ -18,10 +18,10 @@ A standalone Model Context Protocol (MCP) server that enables Claude Code and ot
 
 ## 📋 Quick Start
 
-### Option 1: Docker (Recommended)
+### Option 1: Docker with stdio (Claude Code)
 
 ```bash
-# Run with Docker
+# Run with Docker for Claude Code integration
 docker run -it \
   -e MESHAI_API_URL=http://localhost:8080 \
   -e MESHAI_API_KEY=your-api-key \
@@ -34,19 +34,36 @@ cp .env.template .env  # Edit with your settings
 docker-compose up
 ```
 
-### Option 2: PyPI Installation
+### Option 2: HTTP Server Mode
+
+```bash
+# Run as HTTP API server
+docker run -p 8080:8080 \
+  -e MESHAI_API_URL=http://localhost:8080 \
+  ghcr.io/meshailabs/meshai-mcp-server:latest \
+  meshai-mcp-server serve --transport http
+
+# Test the HTTP API
+curl -H "Authorization: Bearer dev_your-api-key" \
+     http://localhost:8080/v1/tools
+```
+
+### Option 3: PyPI Installation
 
 ```bash
 # Install from PyPI
 pip install meshai-mcp-server
 
-# Run the server
+# Run in stdio mode (for Claude Code)
 export MESHAI_API_URL=http://localhost:8080
 export MESHAI_API_KEY=your-api-key
 meshai-mcp-server
+
+# Or run as HTTP server
+meshai-mcp-server serve --transport http --port 8080
 ```
 
-### Option 3: Development Setup
+### Option 4: Development Setup
 
 ```bash
 # Clone and install
@@ -55,22 +72,33 @@ cd meshai-mcp
 pip install -e ".[dev]"
 
 # Run in development mode
-python -m meshai_mcp.server --dev
+python -m meshai_mcp.cli serve --dev --transport http
 ```
 
 ## 🔧 Configuration
 
 ### Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `MESHAI_API_URL` | MeshAI API endpoint | `http://localhost:8080` |
-| `MESHAI_API_KEY` | API key for authentication | None |
-| `MESHAI_LOG_LEVEL` | Logging level | `INFO` |
+| Variable | Description | Default | Required |
+|----------|-------------|---------|----------|
+| `MESHAI_API_URL` | MeshAI API endpoint | `http://localhost:8080` | Yes |
+| `MESHAI_API_KEY` | API key for authentication | None | For stdio mode |
+| `MESHAI_LOG_LEVEL` | Logging level | `INFO` | No |
+
+### 🔐 Authentication
+
+#### For HTTP Mode:
+- **API Key Required**: Pass via `Authorization: Bearer YOUR_API_KEY` header
+- **Development Keys**: Use `dev_` prefix for testing (e.g., `dev_test123`)
+- **Rate Limiting**: 100 requests/hour for development, configurable for production
+
+#### For stdio Mode:
+- **Environment Variable**: Set `MESHAI_API_KEY` for backend communication
+- **No HTTP Auth**: Authentication handled by Claude Code
 
 ### Claude Code Integration
 
-Add to your Claude Code MCP configuration:
+#### stdio Transport (Recommended):
 
 ```json
 {
@@ -89,7 +117,27 @@ Add to your Claude Code MCP configuration:
 }
 ```
 
-Or if installed via pip:
+#### HTTP Transport (For hosted deployments):
+
+```json
+{
+  "servers": {
+    "meshai": {
+      "command": "curl",
+      "args": [
+        "-X", "POST",
+        "-H", "Authorization: Bearer ${MESHAI_MCP_API_KEY}",
+        "-H", "Content-Type: application/json",
+        "-d", "@-",
+        "https://your-mcp-server.com/v1/mcp"
+      ],
+      "transport": "http"
+    }
+  }
+}
+```
+
+#### Local pip Installation:
 
 ```json
 {
@@ -132,27 +180,61 @@ Comprehensive architecture analysis and recommendations.
 End-to-end feature development from design to testing.
 - **Agents**: product-designer, senior-developer, test-engineer, doc-writer
 
-## 🐋 Docker Deployment
+## 🌐 HTTP API Usage
 
-### Production Deployment
+### Starting HTTP Server
 
 ```bash
-# Using docker-compose
-docker-compose -f docker-compose.yml up -d
+# Using Docker
+docker run -p 8080:8080 \
+  -e MESHAI_API_URL=http://localhost:8080 \
+  ghcr.io/meshailabs/meshai-mcp-server:latest \
+  meshai-mcp-server serve --transport http
 
-# Using Docker directly
-docker run -d \
-  --name meshai-mcp-server \
-  --restart unless-stopped \
-  -e MESHAI_API_URL=https://api.meshai.dev \
-  -e MESHAI_API_KEY=your-production-key \
-  ghcr.io/meshailabs/meshai-mcp-server:latest
+# Using pip
+meshai-mcp-server serve --transport http --port 8080
 ```
 
-### Development with Hot Reload
+### API Endpoints
+
+| Endpoint | Method | Description | Auth Required |
+|----------|--------|-------------|---------------|
+| `/health` | GET | Health check | No |
+| `/v1/tools` | GET | List available tools | Yes |
+| `/v1/workflows` | GET | List workflows | Yes |
+| `/v1/resources` | GET | List resources | Yes |
+| `/v1/mcp` | POST | Execute MCP request | Yes |
+| `/v1/stats` | GET | Usage statistics | Yes |
+| `/docs` | GET | API documentation | No |
+
+### Usage Examples
 
 ```bash
-# Development setup
+# Health check (no auth required)
+curl http://localhost:8080/health
+
+# List available tools
+curl -H "Authorization: Bearer dev_test123" \
+     http://localhost:8080/v1/tools
+
+# Execute a workflow
+curl -X POST \
+     -H "Authorization: Bearer dev_test123" \
+     -H "Content-Type: application/json" \
+     -d '{"method":"mesh_code_review","id":"test","params":{"files":"app.py"}}' \
+     http://localhost:8080/v1/mcp
+
+# Get usage stats
+curl -H "Authorization: Bearer dev_test123" \
+     http://localhost:8080/v1/stats
+```
+
+## 🐋 Docker Deployment
+
+### Development Setup
+
+```bash
+# Development with hot reload
 docker-compose -f docker-compose.dev.yml up
 
 # Run tests
@@ -162,42 +244,15 @@ docker-compose -f docker-compose.dev.yml run --rm mcp-tests
 docker-compose -f docker-compose.dev.yml --profile mock up
 ```
 
-### Kubernetes Deployment
+### Production Considerations
 
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: meshai-mcp-server
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: meshai-mcp-server
-  template:
-    metadata:
-      labels:
-        app: meshai-mcp-server
-    spec:
-      containers:
-      - name: meshai-mcp-server
-        image: ghcr.io/meshailabs/meshai-mcp-server:latest
-        env:
-        - name: MESHAI_API_URL
-          value: "https://api.meshai.dev"
-        - name: MESHAI_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: meshai-secrets
-              key: api-key
-        resources:
-          requests:
-            memory: "128Mi"
-            cpu: "100m"
-          limits:
-            memory: "256Mi"
-            cpu: "200m"
-```
+For production deployment:
+- Use proper API key management
+- Set up rate limiting and monitoring
+- Configure HTTPS/TLS termination
+- Implement proper logging and metrics
+- Consider using a reverse proxy (nginx, Traefik)
+- Set resource limits and scaling policies
 
 ## 🧪 Development
 
