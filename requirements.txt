@@ -1,0 +1,21 @@
+# Core dependencies for MeshAI MCP Server
+httpx>=0.25.0
+structlog>=23.2.0
+pydantic>=2.5.0
+
+# Optional: Official MCP package (when available)
+# mcp>=0.1.0
+
+# For WebSocket support and async operations
+websockets>=11.0.0
+asyncio-mqtt>=0.13.0
+
+# For retry logic and robust HTTP operations
+tenacity>=8.2.0
+
+# For environment variable management
+python-dotenv>=1.0.0
+
+# For CLI interface (if running standalone)
+click>=8.0.0
+rich>=13.0.0
