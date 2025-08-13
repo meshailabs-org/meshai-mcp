@@ -2,6 +2,7 @@
 HTTP Transport for MeshAI MCP Server
 
 Provides HTTP/REST API endpoints for MCP protocol communication.
+Uses secure authentication via MeshAI auth service.
 """
 
 import asyncio
@@ -12,22 +13,21 @@ from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
-import httpx
 import structlog
 from pydantic import BaseModel
 
 from .server import MeshAIMCPServer
 from .protocol import MessageType
+from .auth import AuthClient, AuthMiddleware, get_current_user, get_current_user_optional
+from .auth.models import UserContext, AuthConfig
+from .gateway_client import get_gateway_client, initialize_gateway_client, shutdown_gateway_client
+from .tenant_context import (
+    extract_tenant_context, validate_mcp_message, TenantContextValidator,
+    MCPRequestPreprocessor
+)
 
 logger = structlog.get_logger(__name__)
-
-# Authentication
-security = HTTPBearer()
-
-# Rate limiting storage (in production, use Redis)
-rate_limit_storage: Dict[str, Dict[str, Any]] = {}
 
 class MCPRequest(BaseModel):
     """HTTP request body for MCP calls"""
@@ -43,123 +43,9 @@ class MCPResponse(BaseModel):
     result: Optional[Dict[str, Any]] = None
     error: Optional[Dict[str, Any]] = None
 
-class AuthError(Exception):
-    """Authentication error"""
-    pass
-
-class RateLimitError(Exception):
-    """Rate limit exceeded error"""
-    pass
-
-
-async def validate_api_key(token: str) -> Optional[Dict[str, Any]]:
-    """
-    Validate API key against MeshAI API.
-    
-    In production, this should call the actual MeshAI user service.
-    For now, we'll implement a simple validation.
-    """
-    
-    # Check for development/test tokens
-    if token.startswith('dev_') or token.startswith('test_'):
-        return {
-            "user_id": "dev-user",
-            "plan": "development",
-            "rate_limit": 1000  # requests per hour
-        }
-    
-    # Validate against MeshAI API
-    meshai_api_url = os.getenv('MESHAI_API_URL', 'http://localhost:8080')
-    
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(
-                f"{meshai_api_url}/auth/validate",
-                headers={"Authorization": f"Bearer {token}"}
-            )
-            
-            if response.status_code == 200:
-                return response.json()
-            else:
-                logger.warning(f"API key validation failed: {response.status_code}")
-                return None
-                
-    except Exception as e:
-        logger.error(f"Failed to validate API key: {e}")
-        return None
-
-
-def check_rate_limit(user_id: str, rate_limit: int = 100) -> bool:
-    """
-    Check if user has exceeded rate limit.
-    
-    Args:
-        user_id: User identifier
-        rate_limit: Requests per hour limit
-        
-    Returns:
-        True if within limit, False if exceeded
-    """
-    
-    now = datetime.utcnow()
-    hour_key = now.strftime("%Y-%m-%d-%H")
-    
-    if user_id not in rate_limit_storage:
-        rate_limit_storage[user_id] = {}
-    
-    user_storage = rate_limit_storage[user_id]
-    
-    # Clean old entries (keep last 2 hours)
-    cutoff = now - timedelta(hours=2)
-    to_remove = [
-        key for key in user_storage.keys() 
-        if datetime.strptime(key, "%Y-%m-%d-%H") < cutoff
-    ]
-    for key in to_remove:
-        del user_storage[key]
-    
-    # Check current hour usage
-    current_usage = user_storage.get(hour_key, 0)
-    
-    if current_usage >= rate_limit:
-        return False
-    
-    # Increment usage
-    user_storage[hour_key] = current_usage + 1
-    return True
-
-
-async def authenticate_request(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
-    """
-    Authenticate HTTP request using API key.
-    
-    Returns:
-        User information dictionary
-        
-    Raises:
-        AuthError: If authentication fails
-        RateLimitError: If rate limit exceeded
-    """
-    
-    if not credentials:
-        raise AuthError("Missing authorization header")
-    
-    token = credentials.credentials
-    user = await validate_api_key(token)
-    
-    if not user:
-        raise AuthError("Invalid API key")
-    
-    # Check rate limiting
-    rate_limit = user.get('rate_limit', 100)
-    if not check_rate_limit(user['user_id'], rate_limit):
-        raise RateLimitError(f"Rate limit exceeded: {rate_limit} requests/hour")
-    
-    return user
-
 
 def create_http_app() -> FastAPI:
-    """Create FastAPI application for MCP HTTP transport."""
+    """Create FastAPI application for MCP HTTP transport with secure authentication."""
     
     app = FastAPI(
         title="MeshAI MCP Server",
@@ -169,7 +55,14 @@ def create_http_app() -> FastAPI:
         redoc_url="/redoc"
     )
     
-    # CORS middleware
+    # Initialize authentication
+    auth_config = AuthConfig()
+    auth_client = AuthClient(auth_config)
+    
+    # Add authentication middleware (processes all requests)
+    app.add_middleware(AuthMiddleware, auth_client=auth_client)
+    
+    # CORS middleware (add after auth middleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],  # Configure appropriately for production
@@ -181,26 +74,50 @@ def create_http_app() -> FastAPI:
     # Initialize MCP server
     mcp_server = MeshAIMCPServer()
     
-    @app.exception_handler(AuthError)
-    async def auth_error_handler(request: Request, exc: AuthError):
-        return JSONResponse(
-            status_code=401,
-            content={"error": "Authentication failed", "detail": str(exc)}
-        )
+    @app.on_event("startup")
+    async def startup_event():
+        """Initialize services on startup"""
+        try:
+            await initialize_gateway_client()
+            logger.info("Gateway client initialized")
+        except Exception as e:
+            logger.error("Failed to initialize gateway client", error=str(e))
     
-    @app.exception_handler(RateLimitError)
-    async def rate_limit_error_handler(request: Request, exc: RateLimitError):
-        return JSONResponse(
-            status_code=429,
-            content={"error": "Rate limit exceeded", "detail": str(exc)}
-        )
+    @app.on_event("shutdown")
+    async def shutdown_event():
+        """Clean up services on shutdown"""
+        try:
+            await shutdown_gateway_client()
+            logger.info("Gateway client shut down")
+        except Exception as e:
+            logger.error("Error shutting down gateway client", error=str(e))
     
     @app.get("/health")
     async def health_check():
         """Health check endpoint."""
+        auth_healthy = await auth_client.health_check()
+        
+        # Check gateway health
+        gateway_healthy = False
+        try:
+            gateway_client = get_gateway_client()
+            gateway_healthy = await gateway_client.health_check()
+        except Exception as e:
+            logger.warning("Gateway health check failed", error=str(e))
+        
+        overall_status = "healthy"
+        if not auth_healthy:
+            overall_status = "degraded"
+        if not gateway_healthy:
+            overall_status = "degraded" if overall_status == "healthy" else "unhealthy"
+        
         return {
-            "status": "healthy",
+            "status": overall_status,
             "service": "meshai-mcp-server",
+            "services": {
+                "auth_service": "healthy" if auth_healthy else "unavailable",
+                "gateway_service": "healthy" if gateway_healthy else "unavailable"
+            },
             "timestamp": datetime.utcnow().isoformat()
         }
     
@@ -211,6 +128,7 @@ def create_http_app() -> FastAPI:
             "service": "MeshAI MCP Server",
             "version": "0.1.0",
             "transport": "http",
+            "authentication": "required",
             "endpoints": {
                 "mcp": "/v1/mcp",
                 "health": "/health",
@@ -221,51 +139,137 @@ def create_http_app() -> FastAPI:
     @app.post("/v1/mcp", response_model=MCPResponse)
     async def handle_mcp_request(
         request: MCPRequest,
-        user: Dict[str, Any] = Depends(authenticate_request)
+        http_request: Request,
+        user: UserContext = Depends(get_current_user)
     ) -> MCPResponse:
         """
-        Handle MCP protocol requests over HTTP.
+        Handle MCP protocol requests over HTTP with authentication.
         
-        This endpoint accepts MCP requests and routes them to the appropriate handlers.
+        This endpoint forwards authenticated requests to the private tenant gateway
+        which handles all tenant isolation and security logic.
         """
         
-        logger.info(f"MCP request from user {user['user_id']}: {request.method}")
+        # Generate request ID
+        request_id = f"mcp_{int(datetime.utcnow().timestamp() * 1000)}_{user.user_id}"
+        
+        logger.info(
+            "MCP request from authenticated user",
+            user_id=str(user.user_id),
+            tenant_id=str(user.tenant_id) if user.tenant_id else None,
+            method=request.method,
+            request_id=request_id
+        )
         
         try:
+            # Validate tenant access (basic check only)
+            if not TenantContextValidator.validate_tenant_access(user):
+                return MCPResponse(
+                    type=MessageType.RESPONSE,
+                    id=request.id or request_id,
+                    error={
+                        "code": -32002,
+                        "message": "Tenant access required for MCP operations"
+                    }
+                )
+            
+            # Validate MCP permissions (basic check only)
+            if not TenantContextValidator.validate_mcp_permission(user):
+                return MCPResponse(
+                    type=MessageType.RESPONSE,
+                    id=request.id or request_id,
+                    error={
+                        "code": -32002,
+                        "message": "Insufficient permissions for MCP operations"
+                    }
+                )
+            
             # Convert HTTP request to MCP message format
             mcp_message = {
                 "type": request.type,
                 "method": request.method,
-                "id": request.id,
+                "id": request.id or request_id,
                 "params": request.params or {}
             }
             
-            # Add user context to the request
-            mcp_message["params"]["_user"] = user
-            
-            # Handle the message using the MCP server
-            response = await mcp_server.server.handle_message(mcp_message)
-            
-            if response:
-                return MCPResponse(
-                    type=response["type"],
-                    id=response["id"],
-                    result=response.get("result"),
-                    error=response.get("error")
-                )
-            else:
-                # No response expected (notification)
+            # Validate message structure
+            validation = validate_mcp_message(mcp_message)
+            if not validation["valid"]:
                 return MCPResponse(
                     type=MessageType.RESPONSE,
-                    id=request.id,
-                    result={"status": "accepted"}
+                    id=request.id or request_id,
+                    error={
+                        "code": -32602,
+                        "message": f"Invalid request: {', '.join(validation['errors'])}"
+                    }
+                )
+            
+            # Validate request size
+            if not MCPRequestPreprocessor.validate_request_size(mcp_message):
+                return MCPResponse(
+                    type=MessageType.RESPONSE,
+                    id=request.id or request_id,
+                    error={
+                        "code": -32602,
+                        "message": "Request too large"
+                    }
+                )
+            
+            # Add request metadata
+            client_ip = http_request.client.host if http_request.client else None
+            user_agent = http_request.headers.get("user-agent")
+            
+            processed_message = MCPRequestPreprocessor.add_request_metadata(
+                mcp_message, user, request_id, client_ip, user_agent
+            )
+            
+            # Forward to private gateway
+            gateway_client = get_gateway_client()
+            
+            if not await gateway_client.health_check():
+                logger.warning("Gateway health check failed")
+                return MCPResponse(
+                    type=MessageType.RESPONSE,
+                    id=request.id or request_id,
+                    error={
+                        "code": -32603,
+                        "message": "Gateway service unavailable"
+                    }
+                )
+            
+            # Forward request to private gateway
+            gateway_response = await gateway_client.forward_mcp_request(
+                user=user,
+                mcp_message=processed_message,
+                request_id=request_id,
+                client_ip=client_ip,
+                user_agent=user_agent
+            )
+            
+            # Convert gateway response to MCP response
+            if gateway_response.success:
+                return MCPResponse(
+                    type=MessageType.RESPONSE,
+                    id=request.id or request_id,
+                    result=gateway_response.result
+                )
+            else:
+                return MCPResponse(
+                    type=MessageType.RESPONSE,
+                    id=request.id or request_id,
+                    error=gateway_response.error
                 )
                 
         except Exception as e:
-            logger.error(f"Error handling MCP request: {e}")
+            logger.error(
+                "Error handling MCP request",
+                error=str(e),
+                user_id=str(user.user_id),
+                method=request.method,
+                request_id=request_id
+            )
             return MCPResponse(
                 type=MessageType.RESPONSE,
-                id=request.id,
+                id=request.id or request_id,
                 error={
                     "code": -32603,
                     "message": f"Internal error: {str(e)}"
@@ -273,90 +277,169 @@ def create_http_app() -> FastAPI:
             )
     
     @app.get("/v1/tools")
-    async def list_tools(user: Dict[str, Any] = Depends(authenticate_request)):
-        """List available MCP tools."""
+    async def list_tools(
+        http_request: Request,
+        user: UserContext = Depends(get_current_user)
+    ):
+        """List available MCP tools for authenticated user via gateway."""
+        
+        logger.info("Listing tools", user_id=str(user.user_id))
         
         try:
-            # Get tools using the MCP server
-            handler = mcp_server.server.handlers.get("list_tools")
-            if not handler:
-                raise HTTPException(status_code=500, detail="Tools handler not available")
+            # Basic validation
+            if not TenantContextValidator.validate_tenant_access(user):
+                raise HTTPException(status_code=403, detail="Tenant access required")
             
-            tools = await handler()
-            
-            return {
-                "tools": [
-                    {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "inputSchema": tool.inputSchema
-                    }
-                    for tool in tools
-                ]
+            # Create MCP request for list_tools
+            request_id = f"tools_{int(datetime.utcnow().timestamp() * 1000)}"
+            mcp_message = {
+                "type": "request",
+                "method": "list_tools",
+                "id": request_id,
+                "params": {}
             }
             
+            # Forward to gateway
+            gateway_client = get_gateway_client()
+            client_ip = http_request.client.host if http_request.client else None
+            user_agent = http_request.headers.get("user-agent")
+            
+            gateway_response = await gateway_client.forward_mcp_request(
+                user=user,
+                mcp_message=mcp_message,
+                request_id=request_id,
+                client_ip=client_ip,
+                user_agent=user_agent
+            )
+            
+            if gateway_response.success:
+                return gateway_response.result
+            else:
+                error_msg = gateway_response.error.get("message", "Unknown error") if gateway_response.error else "Unknown error"
+                raise HTTPException(status_code=500, detail=error_msg)
+            
+        except HTTPException:
+            raise
         except Exception as e:
-            logger.error(f"Error listing tools: {e}")
+            logger.error("Error listing tools", error=str(e), user_id=str(user.user_id))
             raise HTTPException(status_code=500, detail=str(e))
     
     @app.get("/v1/resources")
-    async def list_resources(user: Dict[str, Any] = Depends(authenticate_request)):
-        """List available MCP resources."""
+    async def list_resources(
+        http_request: Request,
+        resource_type: Optional[str] = None,
+        limit: int = 50,
+        user: UserContext = Depends(get_current_user)
+    ):
+        """List available MCP resources for authenticated user via gateway."""
+        
+        logger.info("Listing resources", user_id=str(user.user_id))
         
         try:
-            # Get resources using the MCP server
-            handler = mcp_server.server.handlers.get("list_resources")
-            if not handler:
-                raise HTTPException(status_code=500, detail="Resources handler not available")
+            # Basic validation
+            if not TenantContextValidator.validate_tenant_access(user):
+                raise HTTPException(status_code=403, detail="Tenant access required")
             
-            resources = await handler()
-            
-            return {
-                "resources": [
-                    {
-                        "uri": resource.uri,
-                        "name": resource.name,
-                        "description": resource.description,
-                        "mimeType": resource.mimeType
-                    }
-                    for resource in resources
-                ]
+            # Create MCP request for list_resources
+            request_id = f"resources_{int(datetime.utcnow().timestamp() * 1000)}"
+            mcp_message = {
+                "type": "request",
+                "method": "list_resources",
+                "id": request_id,
+                "params": {
+                    "resource_type": resource_type,
+                    "limit": limit
+                }
             }
             
+            # Forward to gateway
+            gateway_client = get_gateway_client()
+            client_ip = http_request.client.host if http_request.client else None
+            user_agent = http_request.headers.get("user-agent")
+            
+            gateway_response = await gateway_client.forward_mcp_request(
+                user=user,
+                mcp_message=mcp_message,
+                request_id=request_id,
+                client_ip=client_ip,
+                user_agent=user_agent
+            )
+            
+            if gateway_response.success:
+                return gateway_response.result
+            else:
+                error_msg = gateway_response.error.get("message", "Unknown error") if gateway_response.error else "Unknown error"
+                raise HTTPException(status_code=500, detail=error_msg)
+            
+        except HTTPException:
+            raise
         except Exception as e:
-            logger.error(f"Error listing resources: {e}")
+            logger.error("Error listing resources", error=str(e), user_id=str(user.user_id))
             raise HTTPException(status_code=500, detail=str(e))
     
     @app.get("/v1/workflows")
-    async def list_workflows(user: Dict[str, Any] = Depends(authenticate_request)):
-        """List available MeshAI workflows."""
+    async def list_workflows(
+        http_request: Request,
+        status: Optional[str] = None,
+        limit: int = 50,
+        user: UserContext = Depends(get_current_user)
+    ):
+        """List available MeshAI workflows for authenticated user via gateway."""
         
-        workflows = []
-        for name, workflow in mcp_server.workflows.items():
-            workflows.append({
-                "name": workflow.name,
-                "description": workflow.description,
-                "agents": workflow.agents,
-                "parameters": workflow.parameters
-            })
+        logger.info("Listing workflows", user_id=str(user.user_id))
         
-        return {"workflows": workflows}
+        try:
+            # Basic validation
+            if not TenantContextValidator.validate_tenant_access(user):
+                raise HTTPException(status_code=403, detail="Tenant access required")
+            
+            # Create MCP request for list_workflows
+            request_id = f"workflows_{int(datetime.utcnow().timestamp() * 1000)}"
+            mcp_message = {
+                "type": "request",
+                "method": "list_workflows",
+                "id": request_id,
+                "params": {
+                    "status": status,
+                    "limit": limit
+                }
+            }
+            
+            # Forward to gateway
+            gateway_client = get_gateway_client()
+            client_ip = http_request.client.host if http_request.client else None
+            user_agent = http_request.headers.get("user-agent")
+            
+            gateway_response = await gateway_client.forward_mcp_request(
+                user=user,
+                mcp_message=mcp_message,
+                request_id=request_id,
+                client_ip=client_ip,
+                user_agent=user_agent
+            )
+            
+            if gateway_response.success:
+                return gateway_response.result
+            else:
+                error_msg = gateway_response.error.get("message", "Unknown error") if gateway_response.error else "Unknown error"
+                raise HTTPException(status_code=500, detail=error_msg)
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("Error listing workflows", error=str(e), user_id=str(user.user_id))
+            raise HTTPException(status_code=500, detail=str(e))
     
-    @app.get("/v1/stats")
-    async def get_stats(user: Dict[str, Any] = Depends(authenticate_request)):
-        """Get server statistics."""
-        
-        # Basic stats (in production, use proper metrics storage)
-        user_usage = rate_limit_storage.get(user['user_id'], {})
-        current_hour = datetime.utcnow().strftime("%Y-%m-%d-%H")
-        current_usage = user_usage.get(current_hour, 0)
+    @app.get("/v1/user/info")
+    async def get_user_info(user: UserContext = Depends(get_current_user)):
+        """Get current user information."""
         
         return {
-            "user_id": user['user_id'],
-            "plan": user.get('plan', 'unknown'),
-            "rate_limit": user.get('rate_limit', 100),
-            "current_usage": current_usage,
-            "remaining": max(0, user.get('rate_limit', 100) - current_usage)
+            "user_id": str(user.user_id),
+            "tenant_id": str(user.tenant_id) if user.tenant_id else None,
+            "permissions": user.permissions,
+            "rate_limit": user.rate_limit,
+            "metadata": user.metadata
         }
     
     return app
