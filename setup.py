@@ -93,7 +93,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "meshai-mcp-server=meshai_mcp.server:main",
+            "meshai-mcp-server=meshai_mcp.cli:main",
             "meshai-mcp=meshai_mcp.cli:main",
         ],
     },

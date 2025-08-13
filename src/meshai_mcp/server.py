@@ -508,5 +508,10 @@ async def main():
     await server.serve()
 
 
-if __name__ == "__main__":
+def run_main():
+    """Run the main function - for CLI use only."""
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    run_main()
