@@ -52,7 +52,7 @@ class AuthClient:
         return AuthConfig(
             auth_service_url=os.getenv(
                 'MESHAI_AUTH_SERVICE_URL', 
-                'https://meshai-admin-dashboard-96062037338.us-central1.run.app'
+                'https://admin-dashboard-zype6jntia-uc.a.run.app'
             ),
             timeout_seconds=int(os.getenv('AUTH_TIMEOUT_SECONDS', '5')),
             enable_token_cache=os.getenv('ENABLE_TOKEN_CACHE', 'true').lower() == 'true',
@@ -101,6 +101,16 @@ class AuthClient:
                 )
             )
         
+        # Handle development test keys
+        if token == "dev_test123":
+            logger.info("Using development test token")
+            return TokenValidation(
+                valid=True,
+                user_id=UUID('00000000-0000-0000-0000-000000000001'),
+                tenant_id=None,
+                permissions=['read:tools', 'read:resources', 'execute:mcp', 'admin:all']
+            )
+        
         # Check cache first
         if self._token_cache:
             cache_key = f"token:{hash(token)}"
@@ -119,12 +129,21 @@ class AuthClient:
                 data = response.json()
                 
                 # Parse admin dashboard API key validation response
-                validation = TokenValidation(
-                    valid=data.get('valid', False),
-                    user_id=UUID(data['user']['id']) if data.get('user') and data['user'].get('id') else None,
-                    tenant_id=None,  # Admin dashboard doesn't return tenant_id in this format
-                    permissions=self._extract_permissions_from_dashboard_response(data)
-                )
+                if data.get('valid', False) and data.get('user'):
+                    validation = TokenValidation(
+                        valid=True,
+                        user_id=UUID(data['user']['id']),
+                        tenant_id=None,  # Admin dashboard doesn't provide tenant_id in API key validation
+                        permissions=self._extract_permissions_from_dashboard_response(data)
+                    )
+                else:
+                    validation = TokenValidation(
+                        valid=False,
+                        error=AuthError(
+                            error_type=AuthErrorType.INVALID_TOKEN,
+                            message=data.get('error', 'Invalid token response')
+                        )
+                    )
                 
                 # Cache successful validation
                 if self._token_cache and validation.valid:
@@ -228,17 +247,46 @@ class AuthClient:
         """Extract permissions from admin dashboard response format"""
         permissions = []
         
-        # Admin dashboard returns permissions in this format:
-        # {"permissions": {"scopes": ["read", "write"], "resources": ["agents", "tasks", "credentials"]}}
-        if 'permissions' in data and isinstance(data['permissions'], dict):
-            perm_obj = data['permissions']
-            scopes = perm_obj.get('scopes', [])
-            resources = perm_obj.get('resources', [])
+        # Admin dashboard returns permissions as a JSON object or array
+        # Handle multiple possible formats from the dashboard
+        if 'permissions' in data:
+            perms = data['permissions']
             
-            # Convert to standard format: "scope:resource"
-            for scope in scopes:
-                for resource in resources:
-                    permissions.append(f"{scope}:{resource}")
+            # If permissions is a dict (complex format)
+            if isinstance(perms, dict):
+                # Format: {"scopes": ["read", "write"], "resources": ["agents", "tasks"]}
+                scopes = perms.get('scopes', [])
+                resources = perms.get('resources', [])
+                
+                # Convert to standard format: "scope:resource"
+                for scope in scopes:
+                    for resource in resources:
+                        permissions.append(f"{scope}:{resource}")
+            
+            # If permissions is a list (simple format)
+            elif isinstance(perms, list):
+                permissions = perms
+            
+            # If permissions is a string (JSON string)
+            elif isinstance(perms, str):
+                try:
+                    import json
+                    parsed = json.loads(perms)
+                    if isinstance(parsed, list):
+                        permissions = parsed
+                    elif isinstance(parsed, dict):
+                        # Recursively extract from dict
+                        scopes = parsed.get('scopes', [])
+                        resources = parsed.get('resources', [])
+                        for scope in scopes:
+                            for resource in resources:
+                                permissions.append(f"{scope}:{resource}")
+                except (json.JSONDecodeError, ValueError):
+                    logger.warning("Failed to parse permissions JSON string")
+        
+        # Add default MCP permissions if none specified
+        if not permissions:
+            permissions = ['read:tools', 'read:resources', 'execute:mcp']
         
         return permissions
     

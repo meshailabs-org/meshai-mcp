@@ -19,7 +19,8 @@ from pydantic import BaseModel
 
 from .server import MeshAIMCPServer
 from .protocol import MessageType
-from .auth import AuthClient, AuthMiddleware, get_current_user, get_current_user_optional
+from .auth.client import AuthClient, get_auth_client
+from .auth.middleware import AuthMiddleware, get_current_user, get_current_user_optional
 from .auth.models import UserContext, AuthConfig
 from .gateway_client import get_gateway_client, initialize_gateway_client, shutdown_gateway_client
 from .tenant_context import (
@@ -78,19 +79,29 @@ def create_http_app() -> FastAPI:
     async def startup_event():
         """Initialize services on startup"""
         try:
+            # Initialize the auth client first
+            await auth_client._ensure_http_client()
+            logger.info("Auth client initialized")
+            
+            # Initialize gateway client
             await initialize_gateway_client()
             logger.info("Gateway client initialized")
         except Exception as e:
-            logger.error("Failed to initialize gateway client", error=str(e))
+            logger.error("Failed to initialize services", error=str(e))
     
     @app.on_event("shutdown")
     async def shutdown_event():
         """Clean up services on shutdown"""
         try:
+            # Shutdown gateway client
             await shutdown_gateway_client()
             logger.info("Gateway client shut down")
+            
+            # Close auth client
+            await auth_client.close()
+            logger.info("Auth client shut down")
         except Exception as e:
-            logger.error("Error shutting down gateway client", error=str(e))
+            logger.error("Error shutting down services", error=str(e))
     
     @app.get("/health")
     async def health_check():

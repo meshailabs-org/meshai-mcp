@@ -71,7 +71,7 @@ class RateLimitInfo:
     """Rate limiting information"""
     limit: int
     remaining: int
-    reset_time: datetime
+    reset_time: float  # Unix timestamp
     window_seconds: int = 3600  # 1 hour default
 
 
@@ -80,7 +80,7 @@ class AuthConfig:
     """Authentication configuration for MCP server"""
     
     # MeshAI API endpoints
-    auth_service_url: str = "https://meshai-admin-dashboard-96062037338.us-central1.run.app"
+    auth_service_url: str = "https://admin-dashboard-zype6jntia-uc.a.run.app"
     validate_endpoint: str = "/api/validate-key"
     
     # Request configuration

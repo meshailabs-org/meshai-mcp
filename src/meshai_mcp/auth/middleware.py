@@ -45,7 +45,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         
         # Get auth client
-        auth_client = self.auth_client or await get_auth_client()
+        try:
+            auth_client = self.auth_client or await get_auth_client()
+        except Exception as e:
+            logger.error("Failed to get auth client", error=str(e))
+            return self._service_error_response("Authentication service unavailable")
         
         # Extract token from Authorization header
         token = self._extract_token(request)
@@ -55,10 +59,14 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return self._unauthorized_response("Authorization token required")
         
         # Validate token with auth service
-        user_context = await auth_client.get_user_context(token)
+        try:
+            user_context = await auth_client.get_user_context(token)
+        except Exception as e:
+            logger.error("Auth service error during validation", error=str(e), path=request.url.path)
+            return self._service_error_response("Authentication service error")
         
         if not user_context:
-            logger.warning("Invalid authorization token", path=request.url.path)
+            logger.warning("Invalid authorization token", path=request.url.path, token_prefix=token[:8] + "..." if len(token) > 8 else "short")
             return self._unauthorized_response("Invalid or expired token")
         
         # Check rate limiting
@@ -123,6 +131,16 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 "X-RateLimit-Reset": str(int(rate_info.reset_time)),
                 "Retry-After": str(rate_info.window_seconds)
             }
+        )
+    
+    def _service_error_response(self, message: str) -> Response:
+        """Create service error response"""
+        
+        return Response(
+            content=f'{{"error": "Service Unavailable", "message": "{message}"}}',
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            media_type="application/json",
+            headers={"Retry-After": "60"}
         )
 
 

@@ -7,6 +7,7 @@ Contains no sensitive tenant logic - all security is handled by the private serv
 
 import asyncio
 import json
+import os
 import structlog
 from datetime import datetime
 from typing import Dict, Any, Optional
@@ -23,12 +24,14 @@ class GatewayClientConfig:
     
     def __init__(
         self,
-        gateway_url: str = "http://localhost:8001",
+        gateway_url: str = None,
         timeout_seconds: int = 30,
         retry_attempts: int = 3,
         retry_delay_seconds: float = 1.0,
         enable_circuit_breaker: bool = True
     ):
+        if gateway_url is None:
+            gateway_url = os.getenv('MESHAI_GATEWAY_URL', 'http://localhost:8001')
         self.gateway_url = gateway_url.rstrip('/')
         self.timeout_seconds = timeout_seconds
         self.retry_attempts = retry_attempts

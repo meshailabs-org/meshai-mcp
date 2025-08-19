@@ -84,11 +84,21 @@ def serve(host: str, port: int, transport: str, dev: bool, log_level: Optional[s
             asyncio.run(server.serve(transport='stdio'))
         else:
             from .http_server import serve_http
+            # Test auth service availability before starting
+            console.print("🔍 Checking authentication service...")
+            auth_available = asyncio.run(check_auth_service())
+            if not auth_available:
+                console.print("⚠️  [bold yellow]Warning:[/bold yellow] Authentication service not available, continuing anyway")
+            
+            console.print("🎯 Starting HTTP server...")
             asyncio.run(serve_http(host=host, port=port))
     except KeyboardInterrupt:
         console.print("\n👋 Shutting down MeshAI MCP Server")
     except Exception as e:
         console.print(f"❌ [bold red]Error:[/bold red] {e}")
+        if dev:
+            import traceback
+            console.print(traceback.format_exc())
         sys.exit(1)
 
 
@@ -214,6 +224,18 @@ def test(message: str):
     # For now, just show what would happen
     console.print("✅ Test message formatted correctly")
     console.print("ℹ️  Use 'echo <message> | meshai-mcp-server' to test with real server")
+
+
+async def check_auth_service() -> bool:
+    """Check if authentication service is available"""
+    try:
+        from .auth.client import AuthClient
+        client = AuthClient()
+        async with client:
+            return await client.health_check()
+    except Exception as e:
+        console.print(f"🔴 Auth service check failed: {e}")
+        return False
 
 
 if __name__ == '__main__':
