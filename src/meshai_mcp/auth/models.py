@@ -80,8 +80,8 @@ class AuthConfig:
     """Authentication configuration for MCP server"""
     
     # MeshAI API endpoints
-    auth_service_url: str = "http://localhost:8000"
-    validate_endpoint: str = "/auth/validate"
+    auth_service_url: str = "https://meshai-admin-dashboard-96062037338.us-central1.run.app"
+    validate_endpoint: str = "/api/validate-key"
     
     # Request configuration
     timeout_seconds: int = 5

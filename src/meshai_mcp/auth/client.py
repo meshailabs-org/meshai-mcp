@@ -2,7 +2,7 @@
 
 import asyncio
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from uuid import UUID
 import os
 
@@ -52,7 +52,7 @@ class AuthClient:
         return AuthConfig(
             auth_service_url=os.getenv(
                 'MESHAI_AUTH_SERVICE_URL', 
-                'http://localhost:8000'
+                'https://meshai-admin-dashboard-96062037338.us-central1.run.app'
             ),
             timeout_seconds=int(os.getenv('AUTH_TIMEOUT_SECONDS', '5')),
             enable_token_cache=os.getenv('ENABLE_TOKEN_CACHE', 'true').lower() == 'true',
@@ -118,12 +118,12 @@ class AuthClient:
             if response.status_code == 200:
                 data = response.json()
                 
-                # Parse successful validation response
+                # Parse admin dashboard API key validation response
                 validation = TokenValidation(
                     valid=data.get('valid', False),
-                    user_id=UUID(data['user_id']) if data.get('user_id') else None,
-                    tenant_id=UUID(data['tenant_id']) if data.get('tenant_id') else None,
-                    permissions=data.get('permissions', [])
+                    user_id=UUID(data['user']['id']) if data.get('user') and data['user'].get('id') else None,
+                    tenant_id=None,  # Admin dashboard doesn't return tenant_id in this format
+                    permissions=self._extract_permissions_from_dashboard_response(data)
                 )
                 
                 # Cache successful validation
@@ -194,14 +194,14 @@ class AuthClient:
             )
     
     async def _call_auth_service(self, token: str) -> httpx.Response:
-        """Make HTTP call to auth service with retries"""
+        """Make HTTP call to admin dashboard API key validation with retries"""
         
         url = self.config.get_validate_url()
         headers = {
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "User-Agent": "MeshAI-MCP-Server/1.0"
         }
-        data = {"token": token}
         
         last_exception = None
         
@@ -209,7 +209,6 @@ class AuthClient:
             try:
                 response = await self._http_client.post(
                     url,
-                    json=data,
                     headers=headers
                 )
                 return response
@@ -224,6 +223,24 @@ class AuthClient:
         
         # All retries failed
         raise last_exception
+    
+    def _extract_permissions_from_dashboard_response(self, data: Dict[str, Any]) -> List[str]:
+        """Extract permissions from admin dashboard response format"""
+        permissions = []
+        
+        # Admin dashboard returns permissions in this format:
+        # {"permissions": {"scopes": ["read", "write"], "resources": ["agents", "tasks", "credentials"]}}
+        if 'permissions' in data and isinstance(data['permissions'], dict):
+            perm_obj = data['permissions']
+            scopes = perm_obj.get('scopes', [])
+            resources = perm_obj.get('resources', [])
+            
+            # Convert to standard format: "scope:resource"
+            for scope in scopes:
+                for resource in resources:
+                    permissions.append(f"{scope}:{resource}")
+        
+        return permissions
     
     async def get_user_context(self, token: str) -> Optional[UserContext]:
         """Get user context from validated token"""
