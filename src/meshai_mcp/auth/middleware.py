@@ -1,11 +1,9 @@
 """Safe authentication middleware for MCP server"""
 
 from typing import Callable, Optional
-from fastapi import Request, Response, HTTPException, status
-from fastapi.middleware.base import BaseHTTPMiddleware
+from fastapi import Request, Response, HTTPException, status, Depends
+from starlette.middleware.base import BaseHTTPMiddleware
 import structlog
-
-from fastapi import Depends
 
 from .client import AuthClient, get_auth_client
 from .models import UserContext, AuthErrorType
