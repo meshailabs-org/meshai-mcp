@@ -8,7 +8,7 @@ Uses secure authentication via MeshAI auth service.
 import asyncio
 import json
 import os
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Union
 from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
@@ -18,7 +18,6 @@ import structlog
 from pydantic import BaseModel
 
 from .server import MeshAIMCPServer
-from .protocol import MessageType
 from .auth.client import AuthClient, get_auth_client
 from .auth.middleware import AuthMiddleware, get_current_user, get_current_user_optional
 from .auth.models import UserContext, AuthConfig
@@ -31,18 +30,27 @@ from .tenant_context import (
 logger = structlog.get_logger(__name__)
 
 class MCPRequest(BaseModel):
-    """HTTP request body for MCP calls"""
-    type: str = MessageType.REQUEST
+    """HTTP request body for MCP calls - JSON-RPC 2.0 format"""
+    jsonrpc: str = "2.0"
     method: str
-    id: str
+    id: Optional[Union[str, int]] = None  # Optional for notifications
     params: Optional[Dict[str, Any]] = None
 
-class MCPResponse(BaseModel):
-    """HTTP response body for MCP calls"""
-    type: str
-    id: str
-    result: Optional[Dict[str, Any]] = None
-    error: Optional[Dict[str, Any]] = None
+class MCPErrorResponse(BaseModel):
+    """Error response for JSON-RPC 2.0"""
+    jsonrpc: str = "2.0"
+    id: Optional[Union[str, int]] = None
+    error: Dict[str, Any]
+
+class MCPSuccessResponse(BaseModel):
+    """Success response for JSON-RPC 2.0"""
+    jsonrpc: str = "2.0"
+    id: Optional[Union[str, int]] = None
+    result: Dict[str, Any]
+
+class MCPNotificationResponse(BaseModel):
+    """Response for notifications (no response needed)"""
+    pass
 
 
 def create_http_app() -> FastAPI:
@@ -147,12 +155,12 @@ def create_http_app() -> FastAPI:
             }
         }
     
-    @app.post("/v1/mcp", response_model=MCPResponse)
+    @app.post("/v1/mcp", response_model=Union[MCPSuccessResponse, MCPErrorResponse, MCPNotificationResponse])
     async def handle_mcp_request(
         request: MCPRequest,
         http_request: Request,
         user: UserContext = Depends(get_current_user)
-    ) -> MCPResponse:
+    ) -> Union[MCPSuccessResponse, MCPErrorResponse, MCPNotificationResponse]:
         """
         Handle MCP protocol requests over HTTP with authentication.
         
@@ -168,15 +176,34 @@ def create_http_app() -> FastAPI:
             user_id=str(user.user_id),
             tenant_id=str(user.tenant_id) if user.tenant_id else None,
             method=request.method,
-            request_id=request_id
+            request_id=request_id,
+            is_notification=request.id is None
         )
         
+        # Check if this is a notification (no ID field)
+        is_notification = request.id is None
+        
         try:
+            # For notifications, handle them and return 204 No Content
+            if is_notification:
+                logger.info(f"Handling notification: {request.method}")
+                
+                # Handle common notification methods
+                if request.method == "notifications/initialized":
+                    logger.info("Client initialized notification received")
+                elif request.method == "notifications/roots/list_changed":
+                    logger.info("Roots list changed notification received")
+                elif request.method.startswith("notifications/"):
+                    logger.info(f"Unknown notification method: {request.method}")
+                
+                # For notifications, return empty response with 204 status
+                from fastapi import Response
+                return Response(status_code=204)
+            
             # Validate tenant access (basic check only)
             if not TenantContextValidator.validate_tenant_access(user):
-                return MCPResponse(
-                    type=MessageType.RESPONSE,
-                    id=request.id or request_id,
+                return MCPErrorResponse(
+                    id=request.id if request.id is not None else request_id,
                     error={
                         "code": -32002,
                         "message": "Tenant access required for MCP operations"
@@ -185,9 +212,8 @@ def create_http_app() -> FastAPI:
             
             # Validate MCP permissions (basic check only)
             if not TenantContextValidator.validate_mcp_permission(user):
-                return MCPResponse(
-                    type=MessageType.RESPONSE,
-                    id=request.id or request_id,
+                return MCPErrorResponse(
+                    id=request.id if request.id is not None else request_id,
                     error={
                         "code": -32002,
                         "message": "Insufficient permissions for MCP operations"
@@ -195,19 +221,20 @@ def create_http_app() -> FastAPI:
                 )
             
             # Convert HTTP request to MCP message format
+            # Ensure ID is string for consistency
+            msg_id = str(request.id) if request.id is not None else request_id
             mcp_message = {
-                "type": request.type,
+                "jsonrpc": "2.0",
                 "method": request.method,
-                "id": request.id or request_id,
+                "id": msg_id,
                 "params": request.params or {}
             }
             
             # Validate message structure
             validation = validate_mcp_message(mcp_message)
             if not validation["valid"]:
-                return MCPResponse(
-                    type=MessageType.RESPONSE,
-                    id=request.id or request_id,
+                return MCPErrorResponse(
+                    id=request.id if request.id is not None else request_id,
                     error={
                         "code": -32602,
                         "message": f"Invalid request: {', '.join(validation['errors'])}"
@@ -216,9 +243,8 @@ def create_http_app() -> FastAPI:
             
             # Validate request size
             if not MCPRequestPreprocessor.validate_request_size(mcp_message):
-                return MCPResponse(
-                    type=MessageType.RESPONSE,
-                    id=request.id or request_id,
+                return MCPErrorResponse(
+                    id=request.id if request.id is not None else request_id,
                     error={
                         "code": -32602,
                         "message": "Request too large"
@@ -233,14 +259,13 @@ def create_http_app() -> FastAPI:
                 mcp_message, user, request_id, client_ip, user_agent
             )
             
-            # Forward to private gateway
+            # Forward to production gateway
             gateway_client = get_gateway_client()
             
             if not await gateway_client.health_check():
                 logger.warning("Gateway health check failed")
-                return MCPResponse(
-                    type=MessageType.RESPONSE,
-                    id=request.id or request_id,
+                return MCPErrorResponse(
+                    id=request.id if request.id is not None else request_id,
                     error={
                         "code": -32603,
                         "message": "Gateway service unavailable"
@@ -258,15 +283,13 @@ def create_http_app() -> FastAPI:
             
             # Convert gateway response to MCP response
             if gateway_response.success:
-                return MCPResponse(
-                    type=MessageType.RESPONSE,
-                    id=request.id or request_id,
-                    result=gateway_response.result
+                return MCPSuccessResponse(
+                    id=request.id if request.id is not None else request_id,
+                    result=gateway_response.result or {}
                 )
             else:
-                return MCPResponse(
-                    type=MessageType.RESPONSE,
-                    id=request.id or request_id,
+                return MCPErrorResponse(
+                    id=request.id if request.id is not None else request_id,
                     error=gateway_response.error
                 )
                 
@@ -278,9 +301,8 @@ def create_http_app() -> FastAPI:
                 method=request.method,
                 request_id=request_id
             )
-            return MCPResponse(
-                type=MessageType.RESPONSE,
-                id=request.id or request_id,
+            return MCPErrorResponse(
+                id=request.id if request.id is not None else request_id,
                 error={
                     "code": -32603,
                     "message": f"Internal error: {str(e)}"

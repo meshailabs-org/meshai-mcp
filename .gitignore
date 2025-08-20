@@ -171,3 +171,21 @@ secrets/
 *.key
 *.pem
 *.crt
+
+# Internal deployment files (not for public repo)
+PRODUCTION_API_KEY_VALIDATION_STATUS.md
+PRODUCTION_DEPLOYMENT.md
+GATEWAY_DEPLOYMENT.md
+calculate_hash.py
+validate_key.py
+test_auth.py
+test_gateway.py
+test_http_server.py
+deploy-gateway.sh
+gateway-config.yaml
+Dockerfile.gateway
+
+# Internal auth implementations with hardcoded values
+src/meshai_mcp/auth/simple_validator.py
+src/meshai_mcp/auth/database_validator.py
+src/meshai_mcp/gateway_service.py

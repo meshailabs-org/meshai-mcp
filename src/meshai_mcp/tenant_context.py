@@ -107,9 +107,12 @@ def validate_mcp_message(mcp_message: Dict[str, Any]) -> Dict[str, Any]:
         validation_result["valid"] = False
         validation_result["errors"].append("Missing required field: method")
     
-    if "id" not in mcp_message:
-        validation_result["valid"] = False
-        validation_result["errors"].append("Missing required field: id")
+    # ID is optional for notifications (JSON-RPC 2.0 spec)
+    # Only validate ID if it's present
+    if "id" in mcp_message and mcp_message["id"] is not None:
+        if not isinstance(mcp_message["id"], (str, int)):
+            validation_result["valid"] = False
+            validation_result["errors"].append("ID must be a string or number")
     
     # Validate method name
     method = mcp_message.get("method", "")

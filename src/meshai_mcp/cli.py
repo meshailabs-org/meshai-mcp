@@ -204,6 +204,53 @@ def config():
 
 
 @main.command()
+@click.option('--host', default='0.0.0.0', help='Host to bind to')
+@click.option('--port', default=8001, help='Port to bind to')
+@click.option('--dev', is_flag=True, help='Run in development mode')
+@click.option('--log-level', default=None, type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR']),
+              help='Logging level')
+def gateway(host: str, port: int, dev: bool, log_level: Optional[str]):
+    """Start the gateway service."""
+    
+    # Set log level
+    if log_level:
+        os.environ['MESHAI_LOG_LEVEL'] = log_level
+    elif dev:
+        os.environ['MESHAI_LOG_LEVEL'] = 'DEBUG'
+    
+    # Show startup info
+    if dev:
+        console.print("🔧 [bold yellow]Development Mode[/bold yellow]")
+    
+    console.print("🚀 Starting MeshAI Gateway Service")
+    console.print(f"📡 Listening on {host}:{port}")
+    console.print(f"🌐 API Documentation: http://{host}:{port}/docs")
+    
+    # Check environment
+    auth_url = os.getenv('MESHAI_AUTH_SERVICE_URL', 'http://localhost:8000')
+    registry_url = os.getenv('MESHAI_AGENT_REGISTRY_URL', 'http://localhost:8001')
+    workflow_url = os.getenv('MESHAI_WORKFLOW_ENGINE_URL', 'http://localhost:8002')
+    
+    console.print(f"🔗 Auth Service: {auth_url}")
+    console.print(f"🤖 Agent Registry: {registry_url}")
+    console.print(f"⚙️  Workflow Engine: {workflow_url}")
+    
+    # Start gateway
+    try:
+        from .gateway_service import serve_gateway
+        console.print("🎯 Starting Gateway Service...")
+        asyncio.run(serve_gateway(host=host, port=port))
+    except KeyboardInterrupt:
+        console.print("\n👋 Shutting down MeshAI Gateway Service")
+    except Exception as e:
+        console.print(f"❌ [bold red]Error:[/bold red] {e}")
+        if dev:
+            import traceback
+            console.print(traceback.format_exc())
+        sys.exit(1)
+
+
+@main.command()
 @click.argument('message')
 def test(message: str):
     """Test the MCP server with a message."""

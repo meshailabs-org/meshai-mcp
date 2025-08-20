@@ -1,7 +1,9 @@
 """Safe authentication middleware for MCP server"""
 
+import time
 from typing import Callable, Optional
 from fastapi import Request, Response, HTTPException, status, Depends
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 import structlog
 
@@ -36,6 +38,29 @@ class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         """Process request with authentication"""
         
+        # Check IP-based rate limiting first (before any processing)
+        client_ip = request.client.host if request.client else "unknown"
+        from .rate_limiter import get_auth_rate_limiter
+        rate_limiter = get_auth_rate_limiter()
+        
+        if not rate_limiter.is_allowed(client_ip):
+            reset_time = rate_limiter.get_reset_time(client_ip)
+            logger.warning("Rate limit exceeded", client_ip=client_ip, path=request.url.path)
+            response = JSONResponse(
+                content={
+                    "error": "Rate limit exceeded", 
+                    "message": "Too many authentication attempts. Try again later.",
+                    "retry_after": int(reset_time - time.time()) if reset_time else 300
+                },
+                status_code=429
+            )
+            response.headers["Retry-After"] = str(300)
+            response.headers["X-RateLimit-Limit"] = str(rate_limiter.max_attempts)
+            response.headers["X-RateLimit-Remaining"] = "0"
+            if reset_time:
+                response.headers["X-RateLimit-Reset"] = str(int(reset_time))
+            return response
+        
         # Skip authentication for public paths
         if request.url.path in self.public_paths:
             return await call_next(request)
@@ -55,7 +80,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
         token = self._extract_token(request)
         
         if not token:
-            logger.warning("Missing authorization token", path=request.url.path)
+            logger.warning("Missing authorization token", path=request.url.path, client_ip=client_ip)
+            rate_limiter.record_failed_attempt(client_ip)
             return self._unauthorized_response("Authorization token required")
         
         # Validate token with auth service
@@ -66,7 +92,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return self._service_error_response("Authentication service error")
         
         if not user_context:
-            logger.warning("Invalid authorization token", path=request.url.path, token_prefix=token[:8] + "..." if len(token) > 8 else "short")
+            logger.warning("Invalid authorization token", path=request.url.path, client_ip=client_ip, token_prefix=token[:8] + "..." if len(token) > 8 else "short")
+            rate_limiter.record_failed_attempt(client_ip)
             return self._unauthorized_response("Invalid or expired token")
         
         # Check rate limiting

@@ -80,7 +80,7 @@ class AuthConfig:
     """Authentication configuration for MCP server"""
     
     # MeshAI API endpoints
-    auth_service_url: str = "https://admin-dashboard-zype6jntia-uc.a.run.app"
+    auth_service_url: str = "https://meshai-admin-dashboard-96062037338.us-central1.run.app"
     validate_endpoint: str = "/api/validate-key"
     
     # Request configuration

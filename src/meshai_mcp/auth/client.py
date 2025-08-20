@@ -52,7 +52,7 @@ class AuthClient:
         return AuthConfig(
             auth_service_url=os.getenv(
                 'MESHAI_AUTH_SERVICE_URL', 
-                'https://admin-dashboard-zype6jntia-uc.a.run.app'
+                'https://meshai-admin-dashboard-96062037338.us-central1.run.app'
             ),
             timeout_seconds=int(os.getenv('AUTH_TIMEOUT_SECONDS', '5')),
             enable_token_cache=os.getenv('ENABLE_TOKEN_CACHE', 'true').lower() == 'true',
@@ -101,14 +101,55 @@ class AuthClient:
                 )
             )
         
-        # Handle development test keys
-        if token == "dev_test123":
-            logger.info("Using development test token")
+        # SECURITY: Use database validation for all API keys
+        # Try database validation first for production keys
+        try:
+            from .database_validator import get_database_validator
+            db_validator = await get_database_validator()
+            db_result = await db_validator.validate_key(token)
+            
+            if db_result and db_result.get('valid'):
+                logger.info("API key validated via database", user_email=db_result.get('email'))
+                return TokenValidation(
+                    valid=True,
+                    user_id=UUID(db_result['user_id']),
+                    tenant_id=UUID(db_result['tenant_id']) if db_result.get('tenant_id') else None,
+                    permissions=db_result.get('permissions', [])
+                )
+        except Exception as e:
+            logger.warning(f"Database validation failed, trying fallback: {e}")
+        
+        # Fallback to simple validator for known test keys only
+        from .simple_validator import SimpleValidator
+        simple_result = SimpleValidator.validate_key(token)
+        
+        if simple_result:
+            logger.info("API key validated via simple validator (fallback)")
+            # Convert tenant_id string to UUID if it's a valid UUID string
+            tenant_id = None
+            if simple_result.get('tenant_id'):
+                try:
+                    tenant_id = UUID(simple_result['tenant_id'])
+                except ValueError:
+                    # If not a valid UUID, create a deterministic UUID from the string
+                    import hashlib
+                    tenant_hash = hashlib.md5(simple_result['tenant_id'].encode()).hexdigest()
+                    tenant_id = UUID(tenant_hash[:8] + '-' + tenant_hash[8:12] + '-' + tenant_hash[12:16] + '-' + tenant_hash[16:20] + '-' + tenant_hash[20:32])
+            
             return TokenValidation(
                 valid=True,
-                user_id=UUID('00000000-0000-0000-0000-000000000001'),
-                tenant_id=None,
-                permissions=['read:tools', 'read:resources', 'execute:mcp', 'admin:all']
+                user_id=UUID(simple_result['user_id']),
+                tenant_id=tenant_id,
+                permissions=simple_result.get('permissions', [])
+            )
+        
+        if not token.startswith('msk_'):
+            return TokenValidation(
+                valid=False,
+                error=AuthError(
+                    error_type=AuthErrorType.INVALID_TOKEN,
+                    message="Invalid API key format - must start with 'msk_'"
+                )
             )
         
         # Check cache first
@@ -158,7 +199,18 @@ class AuthClient:
                     valid=False,
                     error=AuthError(
                         error_type=AuthErrorType.INVALID_TOKEN,
-                        message="Invalid or expired token"
+                        message="Invalid or expired API key"
+                    )
+                )
+            
+            elif response.status_code == 404:
+                # Validation endpoint not found - service may not be deployed yet
+                logger.error("API key validation endpoint not found - service may need deployment")
+                return TokenValidation(
+                    valid=False,
+                    error=AuthError(
+                        error_type=AuthErrorType.SERVICE_UNAVAILABLE,
+                        message="Authentication service endpoint not available. Please ensure the validate-key route is deployed."
                     )
                 )
             
@@ -298,9 +350,15 @@ class AuthClient:
         if not validation.valid or not validation.user_id:
             return None
         
+        # Set default tenant if not provided
+        tenant_id = validation.tenant_id
+        if not tenant_id:
+            # Use a default tenant ID for users without explicit tenant
+            tenant_id = UUID('00000000-0000-0000-0000-000000000001')
+        
         return UserContext(
             user_id=validation.user_id,
-            tenant_id=validation.tenant_id,
+            tenant_id=tenant_id,
             permissions=validation.permissions,
             rate_limit=validation.rate_limit or self.config.default_rate_limit
         )
