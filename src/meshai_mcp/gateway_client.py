@@ -323,7 +323,7 @@ class TenantGatewayClient:
             return False
         
         try:
-            url = f"{self.config.gateway_url}/api/v1/mcp/health"
+            url = f"{self.config.gateway_url}/health"
             
             async with self.session.get(url) as response:
                 if response.status == 200:
@@ -342,7 +342,7 @@ class TenantGatewayClient:
             return {"error": "Client not initialized"}
         
         try:
-            url = f"{self.config.gateway_url}/api/v1/mcp/health"
+            url = f"{self.config.gateway_url}/health"
             
             async with self.session.get(url) as response:
                 if response.status == 200:
